@@ -1,0 +1,707 @@
+/*
+  ===========================================================================
+  DESK CLOCK v2 — ESP32-C3 + 2.8" ILI9341 + XPT2046 touch
+  ===========================================================================
+  Screens (tap = next screen, long-press = jump straight to Agenda):
+    0. Clock      - flip-clock style HH / MM panels, AM/PM, date
+    1. Calendar   - big "day + date" on the left, month grid on the right,
+                    today circled in red
+    2. Agenda     - today's events, "No event available" if empty
+    3. Weather    - rounded purple card, temp, condition, sun+cloud icon
+    4. Quote      - rotating short quote
+    5. Status     - WiFi bars, RSSI pill, IP, sync time
+
+  IDLE ANIMATION:
+    White balls drop from the top one after another and bounce to rest,
+    stacking up tightly from the bottom of the screen. Once every slot
+    is filled, the stack turns red starting from the bottom row upward,
+    then the whole stack fades out and the cycle restarts.
+    Any touch exits back to the Clock screen.
+
+  LIBRARIES NEEDED (Arduino Library Manager):
+    - TFT_eSPI       (Bodmer)  -> requires the User_Setup.h provided with this
+    - ArduinoJson     (Benoit Blanchon)
+    (WiFi.h, HTTPClient.h, time.h are built into the ESP32 core)
+
+  EDIT THE "USER CONFIG" SECTION BELOW BEFORE UPLOADING.
+  ===========================================================================
+*/
+
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+// =========================== USER CONFIG ==================================
+const char* WIFI_SSID     = "YOUR_WIFI_SSID";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+// Google Apps Script (or any endpoint) that returns today's events as JSON:
+// [{"time":"09:00","title":"Team standup"},{"time":"14:30","title":"Dentist"}]
+const char* CALENDAR_URL  = "https://script.google.com/macros/s/XXXXXXXX/exec";
+
+// Open-Meteo needs your lat/lon (no API key required).
+const float LAT = 6.5244;   // example: Lagos
+const float LON = 3.3792;
+const char* CITY_LABEL = "Lagos";
+
+// Timezone POSIX string, e.g. "WAT-1", "GMT0BST,M3.5.0/1,M10.5.0", "EST5EDT,M3.2.0,M11.1.0"
+const char* TZ_STRING = "WAT-1";
+
+const unsigned long IDLE_TIMEOUT_MS   = 20000;   // 20s idle -> screensaver
+const unsigned long SYNC_INTERVAL_MS  = 5UL * 60UL * 1000UL; // 5 min
+// ============================================================================
+
+TFT_eSPI tft = TFT_eSPI();
+
+// ---------------- Colours (matching the reference designs) ----------------
+#define COL_BG        TFT_BLACK
+#define COL_WHITE     0xFFFF
+#define COL_RED       tft.color565(255, 59, 48)
+#define COL_PURPLE1   tft.color565(124, 111, 242)
+#define COL_PURPLE2   tft.color565(75, 60, 214)
+#define COL_DIMGREY   tft.color565(120, 124, 132)
+#define COL_PANEL     tft.color565(30, 31, 35)
+#define COL_PANELHI   tft.color565(44, 46, 51)
+#define COL_GREEN     tft.color565(94, 230, 160)
+
+// ---------------- Touch sensor (TTP223 capacitive module, separate from TFT) ----------------
+// OUT pin of the TTP223 goes to this GPIO. It reads HIGH while touched.
+#define TOUCH_PIN 1
+
+// ---------------- Screens ----------------
+enum Screen { SCR_CLOCK, SCR_CALENDAR, SCR_AGENDA, SCR_WEATHER, SCR_QUOTE, SCR_STATUS, SCR_COUNT };
+Screen currentScreen = SCR_CLOCK;
+bool inScreensaver = false;
+
+// ---------------- Touch/gesture state ----------------
+bool touchActive = false;
+unsigned long touchStartMs = 0;
+unsigned long lastActivityMs = 0;
+const unsigned long LONG_PRESS_MS = 700;
+bool longPressFired = false;
+
+// ---------------- Time ----------------
+int lastDrawnMinute = -1;
+
+// ---------------- Data from network ----------------
+struct Event { String time; String title; };
+Event events[10];
+int eventCount = 0;
+
+String weatherDesc = "Partly Sunny";
+float weatherTemp = 24.0;
+
+const char* quotes[] = {
+  "Small steps every day.",
+  "Done is better than perfect.",
+  "Stay curious.",
+  "Make today count.",
+  "Focus on progress, not perfection."
+};
+int quoteIndex = 0;
+unsigned long lastQuoteMs = 0;
+
+unsigned long lastSyncMs = 0;
+
+// =========================== SETUP ==================================
+void setup() {
+  Serial.begin(115200);
+
+  tft.init();
+  tft.setRotation(1); // landscape
+  tft.fillScreen(COL_BG);
+
+  pinMode(TOUCH_PIN, INPUT); // TTP223 has its own output driver, no pull needed
+
+  tft.setTextColor(COL_WHITE, COL_BG);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("Connecting WiFi...", tft.width()/2, tft.height()/2, 4);
+
+  connectWiFi();
+  syncTime();
+  initBallGrid();
+
+  fetchCalendar();
+  fetchWeather();
+  lastSyncMs = millis();
+  lastActivityMs = millis();
+
+  tft.fillScreen(COL_BG);
+  drawCurrentScreen();
+}
+
+// =========================== LOOP ==================================
+void loop() {
+  handleTouch();
+  unsigned long now = millis();
+
+  if (now - lastSyncMs > SYNC_INTERVAL_MS) {
+    fetchCalendar();
+    fetchWeather();
+    lastSyncMs = now;
+  }
+
+  if (!inScreensaver && (now - lastActivityMs > IDLE_TIMEOUT_MS)) {
+    inScreensaver = true;
+    tft.fillScreen(COL_BG);
+    resetBallStack();
+  }
+
+  if (inScreensaver) {
+    updateAndDrawBalls();
+    delay(16); // ~60fps target for the animation
+    return;
+  }
+
+  if (currentScreen == SCR_CLOCK) {
+    struct tm t;
+    if (getLocalTime(&t) && t.tm_min != lastDrawnMinute) {
+      drawClockScreen();
+      lastDrawnMinute = t.tm_min;
+    }
+  }
+
+  if (currentScreen == SCR_QUOTE && now - lastQuoteMs > 4000) {
+    drawQuoteScreen();
+    lastQuoteMs = now;
+  }
+}
+
+// =========================== WIFI / TIME ==================================
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    delay(300);
+  }
+}
+
+void syncTime() {
+  configTzTime(TZ_STRING, "pool.ntp.org", "time.nist.gov");
+  struct tm timeinfo;
+  int tries = 0;
+  while (!getLocalTime(&timeinfo) && tries < 20) {
+    delay(300);
+    tries++;
+  }
+}
+
+// =========================== NETWORK FETCH ==================================
+void fetchCalendar() {
+  eventCount = 0;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin(CALENDAR_URL);
+  int code = http.GET();
+  if (code == 200) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(4096);
+    if (!deserializeJson(doc, payload)) {
+      JsonArray arr = doc.as<JsonArray>();
+      for (JsonObject obj : arr) {
+        if (eventCount >= 10) break;
+        events[eventCount].time  = obj["time"].as<String>();
+        events[eventCount].title = obj["title"].as<String>();
+        eventCount++;
+      }
+    }
+  }
+  http.end();
+}
+
+void fetchWeather() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(LAT, 4) +
+               "&longitude=" + String(LON, 4) + "&current_weather=true";
+  HTTPClient http;
+  http.begin(url);
+  int code = http.GET();
+  if (code == 200) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(1024);
+    if (!deserializeJson(doc, payload)) {
+      weatherTemp = doc["current_weather"]["temperature"].as<float>();
+      int code_w = doc["current_weather"]["weathercode"].as<int>();
+      weatherDesc = weatherCodeToText(code_w);
+    }
+  }
+  http.end();
+}
+
+String weatherCodeToText(int code) {
+  if (code == 0) return "Clear Sky";
+  if (code <= 3) return "Partly Sunny";
+  if (code <= 48) return "Fog";
+  if (code <= 67) return "Rain";
+  if (code <= 77) return "Snow";
+  if (code <= 82) return "Rain Showers";
+  if (code <= 99) return "Thunderstorm";
+  return "Unknown";
+}
+
+// =========================== TOUCH HANDLING ==================================
+void handleTouch() {
+  bool touched = (digitalRead(TOUCH_PIN) == HIGH);
+
+  if (touched) {
+    lastActivityMs = millis();
+
+    if (inScreensaver) {
+      inScreensaver = false;
+      currentScreen = SCR_CLOCK;
+      tft.fillScreen(COL_BG);
+      drawCurrentScreen();
+      delay(150); // eat this touch so it isn't also read as a tap
+      return;
+    }
+
+    if (!touchActive) {
+      touchActive = true;
+      touchStartMs = millis();
+      longPressFired = false;
+    } else if (!longPressFired && millis() - touchStartMs > LONG_PRESS_MS) {
+      longPressFired = true;
+      goToScreen(SCR_AGENDA);
+    }
+  } else {
+    if (touchActive && !longPressFired) {
+      goToScreen((Screen)((currentScreen + 1) % SCR_COUNT));
+    }
+    touchActive = false;
+  }
+}
+
+void goToScreen(Screen s) {
+  currentScreen = s;
+  tft.fillScreen(COL_BG);
+  drawCurrentScreen();
+}
+
+void drawCurrentScreen() {
+  switch (currentScreen) {
+    case SCR_CLOCK:    drawClockScreen(); break;
+    case SCR_CALENDAR: drawCalendarScreen(); break;
+    case SCR_AGENDA:   drawAgendaScreen(); break;
+    case SCR_WEATHER:  drawWeatherScreen(); break;
+    case SCR_QUOTE:    drawQuoteScreen(); break;
+    case SCR_STATUS:   drawStatusScreen(); break;
+    default: break;
+  }
+}
+
+// =========================== SCREEN: CLOCK (flip style) ==================================
+void drawFlipPanel(int x, int y, int w, int h, const char* value, const char* ampmLabel) {
+  tft.fillRoundRect(x, y, w, h, 10, COL_PANEL);
+  tft.drawFastHLine(x + 4, y + h/2, w - 8, TFT_BLACK);
+  tft.fillCircle(x + 8, y + h/2, 3, TFT_BLACK);
+  tft.fillCircle(x + w - 8, y + h/2, 3, TFT_BLACK);
+
+  if (ampmLabel) {
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(COL_DIMGREY, COL_PANEL);
+    tft.drawString(ampmLabel, x + 10, y + 8, 2);
+  }
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(COL_WHITE, COL_PANEL);
+  tft.drawString(value, x + w/2, y + h/2 + 2, 8); // Font 8: big 7-seg digits
+}
+
+void drawClockScreen() {
+  tft.fillScreen(COL_BG);
+  struct tm t;
+  if (!getLocalTime(&t)) return;
+
+  int h12 = t.tm_hour % 12; if (h12 == 0) h12 = 12;
+  const char* ampm = (t.tm_hour >= 12) ? "PM" : "AM";
+  char hh[3]; sprintf(hh, "%02d", h12);
+  char mm[3]; sprintf(mm, "%02d", t.tm_min);
+
+  int panelW = 118, panelH = 120, gap = 10, topY = 40;
+  int totalW = panelW * 2 + gap;
+  int startX = (tft.width() - totalW) / 2;
+
+  drawFlipPanel(startX, topY, panelW, panelH, hh, ampm);
+  drawFlipPanel(startX + panelW + gap, topY, panelW, panelH, mm, NULL);
+
+  const char* days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+  const char* months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+  char dateStr[24];
+  sprintf(dateStr, "%s, %d %s", days[t.tm_wday], t.tm_mday, months[t.tm_mon]);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(COL_DIMGREY, COL_BG);
+  tft.drawString(dateStr, tft.width()/2, topY + panelH + 20, 2);
+}
+
+// =========================== SCREEN: CALENDAR (split style) ==================================
+void drawCalendarScreen() {
+  struct tm t;
+  if (!getLocalTime(&t)) return;
+
+  const char* daysFull[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+  const char* monthsShort[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+  const char* monthsLong[] = {"JANUARY","FEBRUARY","MARCH","APRIL","MAY","JUNE","JULY","AUGUST","SEPTEMBER","OCTOBER","NOVEMBER","DECEMBER"};
+
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_RED, COL_BG);
+  tft.drawString(daysFull[t.tm_wday], 14, 12, 4);
+  tft.setTextColor(0xBDD7, COL_BG); // light grey-cream
+  tft.drawString(monthsShort[t.tm_mon], 110, 12, 4);
+
+  char dayNum[3]; sprintf(dayNum, "%d", t.tm_mday);
+  tft.setTextColor(COL_WHITE, COL_BG);
+  tft.drawString(dayNum, 12, 42, 8);
+
+  tft.drawFastVLine(156, 10, tft.height() - 20, tft.color565(35,36,39));
+
+  tft.setTextColor(COL_RED, COL_BG);
+  tft.drawString(monthsLong[t.tm_mon], 168, 10, 2);
+
+  const char* dayLabels[] = {"M","T","W","T","F","S","S"};
+  int gridLeft = 168, gridTop = 32, cellW = 21, cellH = 20;
+  for (int i = 0; i < 7; i++) {
+    tft.setTextColor(i >= 5 ? tft.color565(85,87,93) : COL_DIMGREY, COL_BG);
+    tft.drawString(dayLabels[i], gridLeft + i*cellW, gridTop, 2);
+  }
+
+  struct tm firstDay = t;
+  firstDay.tm_mday = 1; firstDay.tm_hour = 12;
+  mktime(&firstDay);
+  int startWday = firstDay.tm_wday - 1; if (startWday < 0) startWday = 6; // Monday-first
+
+  int daysInMonth[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  int dim = daysInMonth[t.tm_mon];
+  int y4 = t.tm_year + 1900;
+  if (t.tm_mon == 1 && ((y4 % 4 == 0 && y4 % 100 != 0) || y4 % 400 == 0)) dim = 29;
+
+  int row = 0, col = startWday;
+  tft.setTextDatum(TL_DATUM);
+  for (int day = 1; day <= dim; day++) {
+    int x = gridLeft + col * cellW;
+    int y = gridTop + 18 + row * cellH;
+
+    if (day == t.tm_mday) {
+      tft.fillCircle(x + 7, y + 7, 9, COL_RED);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextColor(TFT_BLACK, COL_RED);
+      char dstr[3]; sprintf(dstr, "%d", day);
+      tft.drawString(dstr, x + 7, y + 8, 2);
+      tft.setTextDatum(TL_DATUM);
+    } else {
+      bool weekend = col >= 5;
+      tft.setTextColor(weekend ? tft.color565(70,72,78) : tft.color565(214,216,220), COL_BG);
+      char dstr[3]; sprintf(dstr, "%d", day);
+      tft.drawString(dstr, x + 2, y, 2);
+    }
+    col++;
+    if (col > 6) { col = 0; row++; }
+  }
+}
+
+// =========================== SCREEN: AGENDA ==================================
+void drawAgendaScreen() {
+  struct tm t;
+  getLocalTime(&t);
+  const char* days[] = {"SUN","MON","TUE","WED","THU","FRI","SAT"};
+
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_RED, COL_BG);
+  tft.drawString(days[t.tm_wday], 14, 10, 2);
+  tft.setTextColor(COL_WHITE, COL_BG);
+  tft.drawString("Agenda", 14, 24, 4);
+
+  tft.drawFastHLine(14, 62, tft.width() - 28, tft.color565(35,36,39));
+
+  if (eventCount == 0) {
+    tft.setTextColor(tft.color565(106,110,118), COL_BG);
+    tft.drawString("No event available", 14, 84, 4);
+    return;
+  }
+
+  int y = 76;
+  for (int i = 0; i < eventCount && y < tft.height() - 20; i++) {
+    tft.fillCircle(18, y + 6, 3, COL_RED);
+    tft.setTextColor(COL_DIMGREY, COL_BG);
+    tft.drawString(events[i].time, 30, y, 2);
+    tft.setTextColor(COL_WHITE, COL_BG);
+    tft.drawString(events[i].title, 92, y, 2);
+    y += 28;
+  }
+}
+
+// =========================== SCREEN: WEATHER (purple card) ==================================
+void drawWeatherScreen() {
+  tft.fillScreen(COL_BG);
+  int cardX = 60, cardY = 26, cardW = 140, cardH = 180;
+
+  // Solid rounded card (a true per-pixel gradient is possible on this MCU
+  // but costs noticeably more draw time; a flat purple reads just as clean
+  // on a 2.8" panel). Swap COL_PURPLE1 for COL_PURPLE2 if you want it darker.
+  tft.fillRoundRect(cardX, cardY, cardW, cardH, 16, COL_PURPLE1);
+
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_WHITE, COL_PURPLE1);
+  char tstr[8]; sprintf(tstr, "%.0f", weatherTemp);
+  tft.drawString(tstr, cardX + 18, cardY + 22, 7);
+  tft.drawString(weatherDesc, cardX + 18, cardY + cardH - 48, 4);
+
+  char sub[32]; sprintf(sub, "%s", CITY_LABEL);
+  tft.setTextColor(tft.color565(216,212,251), COL_PURPLE1);
+  tft.drawString(sub, cardX + 18, cardY + cardH - 24, 2);
+
+  // sun
+  int sunX = cardX + cardW - 10, sunY = cardY + 66;
+  tft.fillCircle(sunX, sunY, 18, tft.color565(255, 157, 43));
+  tft.fillCircle(sunX - 3, sunY - 3, 15, tft.color565(255, 226, 122));
+
+  // cloud
+  int cx = cardX + cardW - 40, cy = cardY + 92;
+  tft.fillCircle(cx - 14, cy + 6, 13, COL_WHITE);
+  tft.fillCircle(cx + 4, cy - 6, 17, COL_WHITE);
+  tft.fillCircle(cx + 20, cy + 6, 12, COL_WHITE);
+  tft.fillRect(cx - 14, cy + 6, 34, 13, COL_WHITE);
+}
+
+// =========================== SCREEN: QUOTE ==================================
+void drawQuoteScreen() {
+  tft.fillScreen(COL_BG);
+  quoteIndex = (quoteIndex + 1) % (sizeof(quotes)/sizeof(quotes[0]));
+
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_RED, COL_BG);
+  tft.drawString("\"", 14, 4, 7);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(COL_WHITE, COL_BG);
+  tft.drawString(quotes[quoteIndex], tft.width()/2, tft.height()/2 + 10, 4);
+}
+
+// =========================== SCREEN: STATUS ==================================
+void drawStatusScreen() {
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_WHITE, COL_BG);
+  tft.drawString("Status", 14, 10, 4);
+
+  int rowY = 70;
+  int bars[4] = {6, 10, 14, 18};
+  long rssi = WiFi.RSSI();
+  int litBars = rssi > -55 ? 4 : rssi > -65 ? 3 : rssi > -75 ? 2 : 1;
+  for (int i = 0; i < 4; i++) {
+    uint16_t c = (i < litBars) ? COL_WHITE : tft.color565(58,60,65);
+    tft.fillRect(30 + i*10, rowY + 20 - bars[i], 6, bars[i], c);
+  }
+  tft.setTextColor(COL_DIMGREY, COL_BG);
+  tft.drawString("WiFi", 30, rowY + 26, 2);
+
+  // RSSI pill
+  int pillX = 110, pillY = rowY, pillW = 76, pillH = 26;
+  tft.fillRoundRect(pillX, pillY, pillW, pillH, 13, COL_PANEL);
+  float pct = constrain((rssi + 100) / 60.0, 0.05, 1.0); // rough -100..-40 -> 0..1
+  tft.fillRoundRect(pillX, pillY, (int)(pillW * pct), pillH, 13, COL_WHITE);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_BLACK, COL_WHITE);
+  char rssiStr[8]; sprintf(rssiStr, "%ld", rssi);
+  tft.drawString(rssiStr, pillX + 12, pillY + 6, 2);
+
+  tft.setTextColor(tft.color565(199,202,190), COL_BG);
+  char ipLine[32]; sprintf(ipLine, "IP  %s", WiFi.localIP().toString().c_str());
+  tft.drawString(ipLine, 14, 136, 2);
+
+  unsigned long secsAgo = (millis() - lastSyncMs) / 1000;
+  char syncLine[32]; sprintf(syncLine, "SYNC  %lus ago", secsAgo);
+  tft.drawString(syncLine, 14, 158, 2);
+
+  bool connected = WiFi.status() == WL_CONNECTED;
+  tft.fillCircle(220, 142, 4, connected ? COL_GREEN : COL_RED);
+  tft.setTextColor(connected ? COL_GREEN : COL_RED, COL_BG);
+  tft.drawString(connected ? "connected" : "offline", 230, 138, 2);
+}
+
+// =========================== SCREENSAVER: bouncing balls stack ==================================
+// Grid of "slots" the balls settle into, filled bottom row first.
+#define BALL_D      26
+#define BALL_R      13
+#define GRID_COLS   11
+#define GRID_ROWS   7
+#define MAX_BALLS   (GRID_COLS * GRID_ROWS)
+#define SPAWN_EVERY_MS 260
+#define GRAVITY     0.9f
+#define BOUNCE_DAMP 0.42f
+#define STACK_HOLD_MS   1400
+#define ROW_TURN_MS     220   // time for one row to turn red
+#define ROW_FADE_MS     220   // time for one row to fade out
+
+enum BallState { EMPTY, FALLING, SETTLED, TURNING_RED, RED, FADING, GONE };
+
+struct Ball {
+  float x, y, vy;
+  int slotCol, slotRow;   // grid slot this ball is heading for
+  int targetY;
+  BallState state;
+  int bounceCount;
+};
+
+Ball balls[MAX_BALLS];
+int nextSlotIndex = 0;         // next empty slot to fill (bottom row first)
+unsigned long lastSpawnMs = 0;
+unsigned long stackFullAtMs = 0;
+bool stackFull = false;
+
+// Animation phase machine
+enum SaverPhase { PH_DROPPING, PH_HOLD, PH_TURNING_RED, PH_FADING, PH_RESET_PAUSE };
+SaverPhase saverPhase = PH_DROPPING;
+unsigned long phaseStartMs = 0;
+int redRowCursor = 0;   // which row (bottom-up) is currently turning red / fading
+
+int gridLeftX() {
+  return (tft.width() - GRID_COLS * BALL_D) / 2 + BALL_R;
+}
+int rowToY(int row) {
+  // row 0 = bottom row
+  return tft.height() - BALL_R - 4 - row * BALL_D;
+}
+int colToX(int col) {
+  return gridLeftX() + col * BALL_D;
+}
+
+void initBallGrid() {
+  for (int i = 0; i < MAX_BALLS; i++) balls[i].state = EMPTY;
+  nextSlotIndex = 0;
+  stackFull = false;
+  saverPhase = PH_DROPPING;
+  phaseStartMs = millis();
+  lastSpawnMs = 0;
+  redRowCursor = 0;
+}
+
+void resetBallStack() {
+  initBallGrid();
+}
+
+void spawnNextBall() {
+  if (nextSlotIndex >= MAX_BALLS) { stackFull = true; return; }
+
+  int slot = nextSlotIndex++;
+  int row = slot / GRID_COLS;
+  int col = slot % GRID_COLS;
+
+  Ball &b = balls[slot];
+  b.slotRow = row;
+  b.slotCol = col;
+  b.x = colToX(col);
+  b.y = -BALL_R;
+  b.vy = 0;
+  b.targetY = rowToY(row);
+  b.state = FALLING;
+  b.bounceCount = 0;
+
+  if (nextSlotIndex >= MAX_BALLS) stackFull = true;
+}
+
+void updateAndDrawBalls() {
+  unsigned long now = millis();
+  tft.fillScreen(COL_BG); // simple full clear each frame (320x240 @ ~40MHz SPI is fast enough)
+
+  switch (saverPhase) {
+    case PH_DROPPING: {
+      if (!stackFull && now - lastSpawnMs > SPAWN_EVERY_MS) {
+        spawnNextBall();
+        lastSpawnMs = now;
+      }
+      // physics update for falling balls
+      for (int i = 0; i < nextSlotIndex; i++) {
+        Ball &b = balls[i];
+        if (b.state != FALLING) continue;
+        b.vy += GRAVITY;
+        b.y += b.vy;
+        if (b.y >= b.targetY) {
+          b.y = b.targetY;
+          if (fabs(b.vy) > 2.0 && b.bounceCount < 3) {
+            b.vy = -b.vy * BOUNCE_DAMP;
+            b.bounceCount++;
+          } else {
+            b.vy = 0;
+            b.state = SETTLED;
+          }
+        }
+      }
+      if (stackFull) {
+        bool allSettled = true;
+        for (int i = 0; i < MAX_BALLS; i++) if (balls[i].state == FALLING) allSettled = false;
+        if (allSettled) { saverPhase = PH_HOLD; phaseStartMs = now; }
+      }
+      break;
+    }
+
+    case PH_HOLD: {
+      if (now - phaseStartMs > STACK_HOLD_MS) {
+        saverPhase = PH_TURNING_RED;
+        phaseStartMs = now;
+        redRowCursor = 0;
+      }
+      break;
+    }
+
+    case PH_TURNING_RED: {
+      unsigned long elapsed = now - phaseStartMs;
+      int rowsDone = elapsed / ROW_TURN_MS;
+      redRowCursor = rowsDone;
+      for (int i = 0; i < MAX_BALLS; i++) {
+        if (balls[i].slotRow < redRowCursor && balls[i].state == SETTLED) balls[i].state = RED;
+      }
+      if (redRowCursor >= GRID_ROWS) {
+        for (int i = 0; i < MAX_BALLS; i++) if (balls[i].state == SETTLED) balls[i].state = RED;
+        saverPhase = PH_FADING;
+        phaseStartMs = now;
+        redRowCursor = 0;
+      }
+      break;
+    }
+
+    case PH_FADING: {
+      unsigned long elapsed = now - phaseStartMs;
+      int rowsDone = elapsed / ROW_FADE_MS;
+      redRowCursor = rowsDone;
+      for (int i = 0; i < MAX_BALLS; i++) {
+        if (balls[i].slotRow < redRowCursor && (balls[i].state == RED)) balls[i].state = GONE;
+      }
+      if (redRowCursor >= GRID_ROWS) {
+        saverPhase = PH_RESET_PAUSE;
+        phaseStartMs = now;
+      }
+      break;
+    }
+
+    case PH_RESET_PAUSE: {
+      if (now - phaseStartMs > 500) {
+        resetBallStack();
+      }
+      break;
+    }
+  }
+
+  // draw all balls in their current state
+  for (int i = 0; i < MAX_BALLS; i++) {
+    Ball &b = balls[i];
+    if (b.state == EMPTY || b.state == GONE) continue;
+    uint16_t c = (b.state == RED) ? COL_RED : COL_WHITE;
+    tft.fillCircle((int)b.x, (int)b.y, BALL_R - 1, c);
+  }
+
+  // faint time readout, corner
+  struct tm t;
+  if (getLocalTime(&t)) {
+    char timeStr[6];
+    sprintf(timeStr, "%02d:%02d", t.tm_hour, t.tm_min);
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextColor(tft.color565(90,92,98), COL_BG);
+    tft.drawString(timeStr, tft.width() - 8, 8, 2);
+  }
+}
