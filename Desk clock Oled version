@@ -1,0 +1,787 @@
+/*
+  ===========================================================================
+  DESK CLOCK (OLED edition) — ESP32-C3 + 0.9" SSD1306 I2C OLED + TTP223 touch
+  ===========================================================================
+  Screens (tap = next screen, long-press = jump straight to Agenda):
+    0. Clock      - big time, blinking colon, AM/PM, date
+    1. Calendar   - 64px OLED: big date left + month grid right, today inverted
+                    32px OLED: current-week strip, today inverted
+    2. Agenda     - today's events (auto-pages if more than fit),
+                    "No event available" if none
+    3. Weather    - icon + temperature + condition (Open-Meteo, no API key)
+    4. Quote      - rotating short quote
+    5. Status     - WiFi bars, RSSI, IP, last sync
+
+  IDLE ANIMATION (monochrome version of your idea):
+    White balls drop one after another, bounce, and stack tight from the
+    bottom. When the screen is full, rows turn hollow (ring) from the bottom
+    up, then vanish from the bottom up, and it starts over.
+    Any touch exits back to the Clock.
+
+  LIBRARIES (Arduino Library Manager):
+    - U8g2           (olikraus)
+    - ArduinoJson    (Benoit Blanchon)
+    No TFT_eSPI / User_Setup.h needed anymore.
+
+  BOARD: "ESP32C3 Dev Module"  (enable "USB CDC On Boot" if Serial is blank)
+  ===========================================================================
+*/
+
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+// =========================== USER CONFIG ==================================
+// 64 = 0.96" (128x64) OLED   |   32 = 0.91" (128x32) OLED
+#define OLED_HEIGHT 64
+
+const char* WIFI_SSID     = "YOUR_WIFI_SSID";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+// Your Google Apps Script web app URL (returns today's events as JSON)
+const char* CALENDAR_URL  = "https://script.google.com/macros/s/XXXXXXXX/exec";
+
+// Weather location (Open-Meteo, no key needed)
+const float LAT = 6.5244;     // Lagos
+const float LON = 3.3792;
+const char* CITY_LABEL = "Lagos";
+
+// POSIX timezone string. Lagos = "WAT-1"
+const char* TZ_STRING = "WAT-1";
+
+const unsigned long IDLE_TIMEOUT_MS  = 20000;                 // idle -> screensaver
+const unsigned long SYNC_INTERVAL_MS = 5UL * 60UL * 1000UL;   // data refresh
+// ============================================================================
+
+// ---------------- Pins ----------------
+#define SDA_PIN    4
+#define SCL_PIN    5
+#define TOUCH_PIN  3     // TTP223 OUT, HIGH while touched
+
+// ---------------- Display ----------------
+#if OLED_HEIGHT == 64
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, SCL_PIN, SDA_PIN);
+#else
+U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, SCL_PIN, SDA_PIN);
+#endif
+const int W = 128;
+const int H = OLED_HEIGHT;
+
+// ---------------- State ----------------
+enum Screen { SCR_CLOCK, SCR_CALENDAR, SCR_AGENDA, SCR_WEATHER, SCR_QUOTE, SCR_STATUS, SCR_COUNT };
+Screen currentScreen = SCR_CLOCK;
+bool inScreensaver = false;
+bool forceRedraw = true;
+unsigned long lastDrawMs = 0;
+
+// touch
+bool touchActive = false;
+bool longPressFired = false;
+unsigned long touchStartMs = 0;
+unsigned long lastActivityMs = 0;
+const unsigned long LONG_PRESS_MS = 700;
+const unsigned long MIN_TAP_MS    = 40;
+
+// network data
+struct Event { String time; String title; };
+Event events[10];
+int eventCount = 0;
+
+String weatherDesc = "--";
+float weatherTemp = NAN;
+int weatherCode = 2;
+unsigned long lastSyncMs = 0;
+
+const char* quotes[] = {
+  "Small steps every day.",
+  "Done is better than perfect.",
+  "Stay curious.",
+  "Make today count.",
+  "Focus on progress, not perfection."
+};
+int quoteIndex = 0;
+unsigned long lastQuoteMs = 0;
+
+// =========================== HELPERS ==================================
+bool nowTm(struct tm &t) { return getLocalTime(&t, 50); }
+
+int daysInMonth(int month, int year) {
+  static const int d[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  if (month == 1 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) return 29;
+  return d[month];
+}
+
+void drawCentered(const char* s, int baseline) {
+  int w = u8g2.getStrWidth(s);
+  u8g2.drawStr((W - w) / 2, baseline, s);
+}
+
+// =========================== SETUP ==================================
+void setup() {
+  Serial.begin(115200);
+  pinMode(TOUCH_PIN, INPUT);
+
+  u8g2.begin();
+  u8g2.setBusClock(400000);
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tr);
+  drawCentered("Connecting WiFi...", H / 2 + 4);
+  u8g2.sendBuffer();
+
+  connectWiFi();
+  syncTime();
+  randomSeed(micros());
+  resetBalls();
+
+  fetchCalendar();
+  fetchWeather();
+  lastSyncMs = millis();
+  lastActivityMs = millis();
+  forceRedraw = true;
+}
+
+// =========================== LOOP ==================================
+void loop() {
+  handleTouch();
+  unsigned long now = millis();
+
+  if (now - lastSyncMs > SYNC_INTERVAL_MS) {
+    fetchCalendar();
+    fetchWeather();
+    lastSyncMs = millis();
+  }
+
+  if (!inScreensaver && (now - lastActivityMs > IDLE_TIMEOUT_MS)) {
+    inScreensaver = true;
+    resetBalls();
+  }
+
+  if (inScreensaver) {
+    updateAndDrawBalls();
+    delay(10);
+    return;
+  }
+
+  if (currentScreen == SCR_QUOTE && now - lastQuoteMs > 6000) {
+    quoteIndex = (quoteIndex + 1) % (sizeof(quotes) / sizeof(quotes[0]));
+    lastQuoteMs = now;
+    forceRedraw = true;
+  }
+
+  unsigned long interval = (currentScreen == SCR_CLOCK || currentScreen == SCR_AGENDA) ? 250 : 500;
+  if (forceRedraw || now - lastDrawMs >= interval) {
+    renderCurrentScreen();
+    lastDrawMs = now;
+    forceRedraw = false;
+  }
+}
+
+// =========================== WIFI / TIME ==================================
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) delay(300);
+}
+
+void syncTime() {
+  configTzTime(TZ_STRING, "pool.ntp.org", "time.nist.gov");
+  struct tm t;
+  int tries = 0;
+  while (!getLocalTime(&t, 500) && tries < 20) tries++;
+}
+
+// =========================== NETWORK ==================================
+// Google Apps Script answers with a redirect, so redirects MUST be followed.
+void fetchCalendar() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setTimeout(10000);
+  if (!http.begin(client, CALENDAR_URL)) return;
+
+  int code = http.GET();
+  if (code == 200) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(4096);
+    if (!deserializeJson(doc, payload)) {
+      eventCount = 0;
+      for (JsonObject obj : doc.as<JsonArray>()) {
+        if (eventCount >= 10) break;
+        events[eventCount].time  = obj["time"].as<String>();
+        events[eventCount].title = obj["title"].as<String>();
+        eventCount++;
+      }
+    }
+  }
+  http.end();
+}
+
+void fetchWeather() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(LAT, 4) +
+               "&longitude=" + String(LON, 4) + "&current_weather=true";
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setTimeout(10000);
+  if (!http.begin(client, url)) return;
+
+  int code = http.GET();
+  if (code == 200) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(1024);
+    if (!deserializeJson(doc, payload)) {
+      weatherTemp = doc["current_weather"]["temperature"].as<float>();
+      weatherCode = doc["current_weather"]["weathercode"].as<int>();
+      weatherDesc = weatherCodeToText(weatherCode);
+    }
+  }
+  http.end();
+}
+
+String weatherCodeToText(int c) {
+  if (c == 0) return "Clear";
+  if (c <= 3) return "Partly Sunny";
+  if (c <= 48) return "Fog";
+  if (c <= 67) return "Rain";
+  if (c <= 77) return "Snow";
+  if (c <= 82) return "Showers";
+  if (c <= 99) return "Storm";
+  return "Unknown";
+}
+
+// =========================== TOUCH ==================================
+void handleTouch() {
+  bool touched = (digitalRead(TOUCH_PIN) == HIGH);
+  unsigned long now = millis();
+
+  if (touched) {
+    lastActivityMs = now;
+
+    if (inScreensaver) {
+      inScreensaver = false;
+      currentScreen = SCR_CLOCK;
+      forceRedraw = true;
+      touchActive = true;          // swallow this touch
+      longPressFired = true;
+      return;
+    }
+
+    if (!touchActive) {
+      touchActive = true;
+      touchStartMs = now;
+      longPressFired = false;
+    } else if (!longPressFired && now - touchStartMs > LONG_PRESS_MS) {
+      longPressFired = true;
+      goToScreen(SCR_AGENDA);
+    }
+  } else {
+    if (touchActive && !longPressFired && now - touchStartMs >= MIN_TAP_MS) {
+      goToScreen((Screen)((currentScreen + 1) % SCR_COUNT));
+    }
+    touchActive = false;
+  }
+}
+
+void goToScreen(Screen s) {
+  currentScreen = s;
+  if (s == SCR_QUOTE) {
+    quoteIndex = (quoteIndex + 1) % (sizeof(quotes) / sizeof(quotes[0]));
+    lastQuoteMs = millis();
+  }
+  forceRedraw = true;
+}
+
+// =========================== RENDER ==================================
+void renderCurrentScreen() {
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+  switch (currentScreen) {
+    case SCR_CLOCK:    drawClockScreen(); break;
+    case SCR_CALENDAR: drawCalendarScreen(); break;
+    case SCR_AGENDA:   drawAgendaScreen(); break;
+    case SCR_WEATHER:  drawWeatherScreen(); break;
+    case SCR_QUOTE:    drawQuoteScreen(); break;
+    case SCR_STATUS:   drawStatusScreen(); break;
+    default: break;
+  }
+  u8g2.sendBuffer();
+}
+
+// ---------------- CLOCK ----------------
+void drawClockScreen() {
+  struct tm t;
+  if (!nowTm(t)) {
+    u8g2.setFont(u8g2_font_6x10_tr);
+    drawCentered("Waiting for time...", H / 2 + 4);
+    return;
+  }
+
+  int h12 = t.tm_hour % 12; if (h12 == 0) h12 = 12;
+  char hh[3], mm[3];
+  sprintf(hh, "%02d", h12);
+  sprintf(mm, "%02d", t.tm_min);
+
+  u8g2.setFont(H == 64 ? u8g2_font_logisoso32_tn : u8g2_font_logisoso22_tn);
+  int w2 = u8g2.getStrWidth("00");
+  int wc = u8g2.getStrWidth(":");
+  int gap = 3;
+  int total = w2 * 2 + wc + gap * 2;
+  int x0 = (W - total) / 2;
+  int base = (H == 64) ? 60 : 28;
+
+  u8g2.drawStr(x0, base, hh);
+  if (t.tm_sec % 2 == 0) u8g2.drawStr(x0 + w2 + gap, base, ":");   // blinking colon
+  u8g2.drawStr(x0 + w2 + gap + wc + gap, base, mm);
+
+  const char* ampm = (t.tm_hour >= 12) ? "PM" : "AM";
+  u8g2.setFont(u8g2_font_6x10_tr);
+
+  if (H == 64) {
+    const char* days[]   = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    const char* months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+    char dateStr[16];
+    sprintf(dateStr, "%s %d %s", days[t.tm_wday], t.tm_mday, months[t.tm_mon]);
+    u8g2.drawStr(0, 9, ampm);
+    u8g2.drawStr(W - u8g2.getStrWidth(dateStr), 9, dateStr);
+  } else {
+    u8g2.drawStr(W - 13, 31, ampm);
+  }
+}
+
+// ---------------- CALENDAR ----------------
+void drawCalendarScreen() {
+  struct tm t;
+  if (!nowTm(t)) return;
+  if (H == 64) drawCalendar64(t); else drawCalendar32(t);
+}
+
+void drawCalendar64(struct tm &t) {
+  const char* dayAbbr[] = {"SUN","MON","TUE","WED","THU","FRI","SAT"};
+  const char* monAbbr[] = {"JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"};
+  const char* monLong[] = {"JANUARY","FEBRUARY","MARCH","APRIL","MAY","JUNE","JULY","AUGUST","SEPTEMBER","OCTOBER","NOVEMBER","DECEMBER"};
+
+  // left: day name, month, big date
+  u8g2.setFont(u8g2_font_helvB10_tr);
+  u8g2.drawStr(2, 12, dayAbbr[t.tm_wday]);
+  u8g2.drawStr(2, 26, monAbbr[t.tm_mon]);
+  u8g2.setFont(u8g2_font_logisoso28_tn);
+  char d[3]; sprintf(d, "%d", t.tm_mday);
+  u8g2.drawStr(2, 61, d);
+
+  u8g2.drawVLine(57, 2, 60);
+
+  // right: month grid (Monday first)
+  u8g2.setFont(u8g2_font_5x7_tr);
+  u8g2.drawStr(62, 7, monLong[t.tm_mon]);
+
+  const char* dl[] = {"M","T","W","T","F","S","S"};
+  u8g2.setFont(u8g2_font_4x6_tr);
+  for (int i = 0; i < 7; i++) u8g2.drawStr(62 + i * 9 + 2, 15, dl[i]);
+
+  struct tm first = t;
+  first.tm_mday = 1; first.tm_hour = 12;
+  mktime(&first);
+  int col = (first.tm_wday + 6) % 7;
+  int row = 0;
+  int dim = daysInMonth(t.tm_mon, t.tm_year + 1900);
+
+  for (int day = 1; day <= dim; day++) {
+    int cx = 62 + col * 9;
+    int base = 23 + row * 8;
+    char s[3]; sprintf(s, "%d", day);
+    int tx = cx + (day < 10 ? 2 : 0);
+
+    if (day == t.tm_mday) {
+      u8g2.setDrawColor(1);
+      u8g2.drawBox(cx, base - 6, 9, 8);
+      u8g2.setDrawColor(0);
+      u8g2.drawStr(tx, base, s);
+      u8g2.setDrawColor(1);
+    } else {
+      u8g2.drawStr(tx, base, s);
+    }
+    col++;
+    if (col > 6) { col = 0; row++; }
+  }
+}
+
+void drawCalendar32(struct tm &t) {
+  const char* dl[] = {"M","T","W","T","F","S","S"};
+  const char* monLong[] = {"JANUARY","FEBRUARY","MARCH","APRIL","MAY","JUNE","JULY","AUGUST","SEPTEMBER","OCTOBER","NOVEMBER","DECEMBER"};
+
+  int sinceMon = (t.tm_wday + 6) % 7;
+  int cellW = 18;
+  int left = (W - cellW * 7) / 2;
+
+  for (int i = 0; i < 7; i++) {
+    struct tm d = t;
+    d.tm_mday += i - sinceMon;
+    d.tm_hour = 12;
+    mktime(&d);
+
+    int cx = left + i * cellW;
+    u8g2.setFont(u8g2_font_5x7_tr);
+    u8g2.drawStr(cx + 7, 8, dl[i]);
+
+    char s[3]; sprintf(s, "%d", d.tm_mday);
+    u8g2.setFont(u8g2_font_6x10_tr);
+    int tx = cx + (cellW - u8g2.getStrWidth(s)) / 2;
+    if (i == sinceMon) {
+      u8g2.drawBox(cx + 1, 11, cellW - 2, 13);
+      u8g2.setDrawColor(0);
+      u8g2.drawStr(tx, 21, s);
+      u8g2.setDrawColor(1);
+    } else {
+      u8g2.drawStr(tx, 21, s);
+    }
+  }
+  u8g2.setFont(u8g2_font_4x6_tr);
+  char hdr[24]; sprintf(hdr, "%s %d", monLong[t.tm_mon], t.tm_year + 1900);
+  drawCentered(hdr, 31);
+}
+
+// ---------------- AGENDA ----------------
+void drawAgendaScreen() {
+  u8g2.setFont(u8g2_font_6x10_tr);
+
+  int top, lineH, perPage;
+  if (H == 64) {
+    struct tm t;
+    const char* days[] = {"SUN","MON","TUE","WED","THU","FRI","SAT"};
+    u8g2.drawStr(0, 9, "AGENDA");
+    if (nowTm(t)) u8g2.drawStr(W - 18, 9, days[t.tm_wday]);
+    u8g2.drawHLine(0, 12, W);
+    top = 25; lineH = 12; perPage = 4;
+  } else {
+    top = 11; lineH = 14; perPage = 2;
+  }
+
+  if (eventCount == 0) {
+    drawCentered("No event available", H == 64 ? 40 : 20);
+    return;
+  }
+
+  int pages = (eventCount + perPage - 1) / perPage;
+  int page = (pages > 1) ? (int)((millis() / 3000) % pages) : 0;
+
+  for (int i = 0; i < perPage; i++) {
+    int idx = page * perPage + i;
+    if (idx >= eventCount) break;
+    int y = top + i * lineH;
+
+    String tm = events[idx].time;
+    if (tm.length() > 5) tm = tm.substring(0, 5);
+    u8g2.drawStr(0, y, tm.c_str());
+
+    char title[17];
+    strncpy(title, events[idx].title.c_str(), 15);
+    title[15] = '\0';
+    u8g2.drawStr(38, y, title);
+  }
+
+  if (pages > 1) {                       // page dots
+    for (int p = 0; p < pages; p++) {
+      int dx = W - 4 - (pages - 1 - p) * 5;
+      if (p == page) u8g2.drawDisc(dx, H - 3, 1); else u8g2.drawPixel(dx, H - 3);
+    }
+  }
+}
+
+// ---------------- WEATHER ----------------
+void drawCloudShape(int cx, int cy, int grow, int color) {
+  u8g2.setDrawColor(color);
+  u8g2.drawDisc(cx - 11, cy + 5, 7 + grow);
+  u8g2.drawDisc(cx,      cy - 1, 10 + grow);
+  u8g2.drawDisc(cx + 12, cy + 5, 7 + grow);
+  u8g2.drawBox(cx - 11, cy + 5 - grow, 24, 8 + grow * 2);
+}
+
+void drawSun(int cx, int cy, int r) {
+  u8g2.setDrawColor(1);
+  u8g2.drawDisc(cx, cy, r);
+  for (int a = 0; a < 8; a++) {
+    float rad = a * 0.7854f;
+    int x1 = cx + cos(rad) * (r + 3), y1 = cy + sin(rad) * (r + 3);
+    int x2 = cx + cos(rad) * (r + 6), y2 = cy + sin(rad) * (r + 6);
+    u8g2.drawLine(x1, y1, x2, y2);
+  }
+}
+
+void drawWeatherIcon(int cx, int cy) {
+  if (weatherCode == 0) {                       // clear
+    drawSun(cx, cy, 9);
+  } else if (weatherCode <= 3) {                // partly sunny
+    drawSun(cx + 10, cy - 8, 7);
+    drawCloudShape(cx - 2, cy + 6, 2, 0);
+    drawCloudShape(cx - 2, cy + 6, 0, 1);
+  } else {                                      // cloudy / rain
+    drawCloudShape(cx, cy, 0, 1);
+    if (weatherCode >= 51 && weatherCode <= 82) {
+      u8g2.setDrawColor(1);
+      for (int i = 0; i < 3; i++) u8g2.drawLine(cx - 10 + i * 10, cy + 16, cx - 12 + i * 10, cy + 21);
+    }
+  }
+  u8g2.setDrawColor(1);
+}
+
+void drawWeatherScreen() {
+  char tstr[8];
+  if (isnan(weatherTemp)) strcpy(tstr, "--");
+  else sprintf(tstr, "%.0f", weatherTemp);
+
+  if (H == 64) {
+    drawWeatherIcon(28, 32);
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.drawStr(W - u8g2.getStrWidth(CITY_LABEL), 9, CITY_LABEL);
+
+    u8g2.setFont(u8g2_font_logisoso28_tn);
+    u8g2.drawStr(60, 42, tstr);
+    int w = u8g2.getStrWidth(tstr);
+    u8g2.drawCircle(60 + w + 5, 18, 2);          // degree sign
+    u8g2.setFont(u8g2_font_helvB10_tr);
+    u8g2.drawStr(60 + w + 10, 28, "C");
+
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.drawStr(56, 60, weatherDesc.c_str());
+  } else {
+    u8g2.setFont(u8g2_font_logisoso22_tn);
+    u8g2.drawStr(4, 28, tstr);
+    int w = u8g2.getStrWidth(tstr);
+    u8g2.drawCircle(4 + w + 5, 9, 2);
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.drawStr(4 + w + 10, 28, "C");
+    u8g2.drawStr(72, 12, weatherDesc.c_str());
+    u8g2.drawStr(72, 28, CITY_LABEL);
+  }
+}
+
+// ---------------- QUOTE ----------------
+void drawWrapped(const char* txt, int firstBaseline, int lineH, int maxChars) {
+  String s = txt;
+  int start = 0, line = 0;
+  int maxLines = (H == 64) ? 4 : 2;
+  while (start < (int)s.length() && line < maxLines) {
+    int end = start + maxChars;
+    if (end >= (int)s.length()) end = s.length();
+    else {
+      int sp = s.lastIndexOf(' ', end);
+      if (sp > start) end = sp;
+    }
+    String ln = s.substring(start, end);
+    ln.trim();
+    drawCentered(ln.c_str(), firstBaseline + line * lineH);
+    start = end;
+    while (start < (int)s.length() && s[start] == ' ') start++;
+    line++;
+  }
+}
+
+void drawQuoteScreen() {
+  u8g2.setFont(u8g2_font_6x10_tr);
+  if (H == 64) {
+    u8g2.setFont(u8g2_font_helvB10_tr);
+    u8g2.drawStr(0, 12, "\"");
+    u8g2.setFont(u8g2_font_6x10_tr);
+    drawWrapped(quotes[quoteIndex], 30, 13, 20);
+  } else {
+    drawWrapped(quotes[quoteIndex], 12, 13, 20);
+  }
+}
+
+// ---------------- STATUS ----------------
+void drawStatusScreen() {
+  bool connected = WiFi.status() == WL_CONNECTED;
+  long rssi = WiFi.RSSI();
+  int lit = !connected ? 0 : rssi > -55 ? 4 : rssi > -65 ? 3 : rssi > -75 ? 2 : 1;
+
+  unsigned long secsAgo = (millis() - lastSyncMs) / 1000;
+  char l1[24], l2[28], l3[24];
+  sprintf(l1, connected ? "%ld dBm" : "offline", rssi);
+  sprintf(l2, "IP %s", WiFi.localIP().toString().c_str());
+  sprintf(l3, "Sync %lus ago", secsAgo);
+
+  u8g2.setFont(u8g2_font_6x10_tr);
+
+  if (H == 64) {
+    u8g2.drawStr(0, 9, "STATUS");
+    u8g2.drawHLine(0, 12, W);
+    for (int i = 0; i < 4; i++) {
+      int bh = 4 + i * 4;
+      if (i < lit) u8g2.drawBox(4 + i * 7, 40 - bh, 5, bh);
+      else         u8g2.drawFrame(4 + i * 7, 40 - bh, 5, bh);
+    }
+    u8g2.drawStr(38, 28, l1);
+    u8g2.drawStr(38, 40, connected ? "connected" : "no WiFi");
+    u8g2.drawStr(0, 52, l2);
+    u8g2.drawStr(0, 63, l3);
+  } else {
+    for (int i = 0; i < 4; i++) {
+      int bh = 3 + i * 3;
+      if (i < lit) u8g2.drawBox(2 + i * 6, 14 - bh, 4, bh);
+      else         u8g2.drawFrame(2 + i * 6, 14 - bh, 4, bh);
+    }
+    u8g2.drawStr(32, 11, l1);
+    u8g2.drawStr(0, 28, l2);
+  }
+}
+
+// =========================== SCREENSAVER: stacking balls ==================================
+#define BALL_R      3
+#define BALL_D      8
+#define GRID_COLS   16
+#define GRID_ROWS   (OLED_HEIGHT / BALL_D)
+#define MAX_BALLS   (GRID_COLS * GRID_ROWS)
+
+#define SPAWN_EVERY_MS  110
+#define GRAVITY         0.35f
+#define BOUNCE_DAMP     0.45f
+#define HOLD_MS         1200
+#define ROW_RING_MS     260
+#define ROW_GONE_MS     200
+#define PAUSE_MS        600
+
+enum BallState : uint8_t { B_EMPTY, B_FALLING, B_SOLID, B_RING, B_GONE };
+
+struct Ball {
+  float y, vy;
+  int16_t targetY;
+  uint8_t col, row, bounces;
+  BallState state;
+};
+
+Ball balls[MAX_BALLS];
+uint8_t rowOrder[GRID_ROWS][GRID_COLS];
+int nextSlot = 0;
+bool stackFull = false;
+unsigned long lastSpawnMs = 0;
+
+enum SaverPhase { PH_DROPPING, PH_HOLD, PH_RING, PH_GONE, PH_PAUSE };
+SaverPhase phase = PH_DROPPING;
+unsigned long phaseStartMs = 0;
+
+void resetBalls() {
+  for (int i = 0; i < MAX_BALLS; i++) balls[i].state = B_EMPTY;
+  for (int r = 0; r < GRID_ROWS; r++) {
+    for (int c = 0; c < GRID_COLS; c++) rowOrder[r][c] = c;
+    for (int c = GRID_COLS - 1; c > 0; c--) {            // shuffle so balls land in random columns
+      int j = random(c + 1);
+      uint8_t tmp = rowOrder[r][c]; rowOrder[r][c] = rowOrder[r][j]; rowOrder[r][j] = tmp;
+    }
+  }
+  nextSlot = 0;
+  stackFull = false;
+  phase = PH_DROPPING;
+  phaseStartMs = millis();
+  lastSpawnMs = 0;
+}
+
+void spawnBall() {
+  if (nextSlot >= MAX_BALLS) { stackFull = true; return; }
+  int slot = nextSlot++;
+  int row = slot / GRID_COLS;
+  int k = slot % GRID_COLS;
+  Ball &b = balls[slot];
+  b.row = row;
+  b.col = rowOrder[row][k];
+  b.y = -BALL_R;
+  b.vy = 0;
+  b.bounces = 0;
+  b.targetY = H - BALL_R - 1 - row * BALL_D;
+  b.state = B_FALLING;
+  if (nextSlot >= MAX_BALLS) stackFull = true;
+}
+
+void updateAndDrawBalls() {
+  unsigned long now = millis();
+
+  switch (phase) {
+    case PH_DROPPING:
+      if (!stackFull && now - lastSpawnMs > SPAWN_EVERY_MS) {
+        spawnBall();
+        lastSpawnMs = now;
+      }
+      for (int i = 0; i < nextSlot; i++) {
+        Ball &b = balls[i];
+        if (b.state != B_FALLING) continue;
+        b.vy += GRAVITY;
+        b.y += b.vy;
+        if (b.y >= b.targetY) {
+          b.y = b.targetY;
+          if (b.vy > 1.5f && b.bounces < 3) {
+            b.vy = -b.vy * BOUNCE_DAMP;
+            b.bounces++;
+          } else {
+            b.vy = 0;
+            b.state = B_SOLID;
+          }
+        }
+      }
+      if (stackFull) {
+        bool settled = true;
+        for (int i = 0; i < MAX_BALLS; i++) if (balls[i].state == B_FALLING) settled = false;
+        if (settled) { phase = PH_HOLD; phaseStartMs = now; }
+      }
+      break;
+
+    case PH_HOLD:
+      if (now - phaseStartMs > HOLD_MS) { phase = PH_RING; phaseStartMs = now; }
+      break;
+
+    case PH_RING: {
+      int rows = (now - phaseStartMs) / ROW_RING_MS;
+      for (int i = 0; i < MAX_BALLS; i++)
+        if (balls[i].row < rows && balls[i].state == B_SOLID) balls[i].state = B_RING;
+      if (rows >= GRID_ROWS) { phase = PH_GONE; phaseStartMs = now; }
+      break;
+    }
+
+    case PH_GONE: {
+      int rows = (now - phaseStartMs) / ROW_GONE_MS;
+      for (int i = 0; i < MAX_BALLS; i++)
+        if (balls[i].row < rows && balls[i].state == B_RING) balls[i].state = B_GONE;
+      if (rows >= GRID_ROWS) { phase = PH_PAUSE; phaseStartMs = now; }
+      break;
+    }
+
+    case PH_PAUSE:
+      if (now - phaseStartMs > PAUSE_MS) resetBalls();
+      break;
+  }
+
+  // draw
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+  for (int i = 0; i < MAX_BALLS; i++) {
+    Ball &b = balls[i];
+    if (b.state == B_EMPTY || b.state == B_GONE) continue;
+    int x = b.col * BALL_D + BALL_D / 2;
+    int y = (int)b.y;
+    if (b.state == B_RING) u8g2.drawCircle(x, y, BALL_R);
+    else                   u8g2.drawDisc(x, y, BALL_R);
+  }
+
+  // tiny time readout, top-left, on a cleared patch
+  struct tm t;
+  if (nowTm(t)) {
+    char ts[6];
+    sprintf(ts, "%02d:%02d", t.tm_hour, t.tm_min);
+    u8g2.setDrawColor(0);
+    u8g2.drawBox(0, 0, 24, 8);
+    u8g2.setDrawColor(1);
+    u8g2.setFont(u8g2_font_4x6_tr);
+    u8g2.drawStr(2, 6, ts);
+  }
+  u8g2.sendBuffer();
+}
